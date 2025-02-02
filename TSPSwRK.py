@@ -1,261 +1,667 @@
-from random import randint
+from random import randint, sample
 from hashlib import sha256
 from py_ecc.bls.hash_to_curve import hash_to_G1
 from fields import Fq, Fq2, Fq12
 from pairing import ate_pairing
 from util import hash256, hash512
-from bls12381 import q,a,b,gx,gy,g2x,g2y,n,h,h_eff, k, parameters
-from ec import ( default_ec, default_ec_twist, bytes_to_point, 
-                G1Infinity, G2Infinity, G1Generator,G2Generator,
+from bls12381 import q,a,b,gx,gy,g2x,g2y,n,h,h_eff,k, parameters
+from ec import ( default_ec, default_ec_twist, bytes_to_point,
+                G1Infinity, G2Infinity, G1Generator,G2Generator, 
                 G1FromBytes, G2FromBytes, point_to_bytes,
-                add_points, scalar_mult, y_for_x, AffinePoint)
+                add_points, scalar_mult, AffinePoint)
+
+
+##############################################################################
+# Helper functions
+##############################################################################
+
+def isEqual(pointA, pointB)-> bool:
+    """
+    Checks exact equality of two AffinePoint objects in G1 or G2.
+    """
+    if not isinstance(pointA, AffinePoint):
+        return False
+    if not isinstance(pointB, AffinePoint):
+        return False
+    return (
+        pointA.x == pointB.x and pointA.y == pointB.y and pointA.infinity == pointB.infinity
+    )
+
+def add_points_ec(a, b, ec_curve, field_mod):
+    return add_points(a, b, ec_curve, field_mod)
+
+def get_lagrange_coefficient(idx, subset_ids, p):
+    """
+    Standard Lagrange coefficient for index `idx` among subset of node IDs `subset_ids`.
+    ℓ_idx(0) = ∏_{j ∈ subset_ids, j != idx} (−j)/(idx−j) (mod p).
+    """
+    numerator = 1
+    denominator = 1
+    for j in subset_ids:
+        if j == idx:
+            continue
+        numerator = (numerator * (-j % p)) % p
+        denominator = (denominator * ((idx - j) % p)) % p
+    denom_inv = pow(denominator, p - 2, p)
+    return (numerator * denom_inv) % p
+
+
+##############################################################################
+# Node class
+##############################################################################
 
 class Node:
-    def __init__(self, node_id, public_parameters, threshold, message):
-        self.node_id                = node_id
-        self.public_parameters      = public_parameters
-        self.threshold              = threshold
-        self.f_poly                 = None
-        self.g_poly                 = None
-        self.commitments            = None
-        self.received_commitments   = {}
-        self.received_shares        = {}
-        self.vk                     = []
-        self.sk                     = []
-        self.partial_vk             = []
-        self.partial_sk             = []
-        self.rho                    = []
-        self.point_exp_rho          = []
-        self.partial_sk_prime       = []
-        self.partial_vk_prime       = []
-        self.indexed_message        = {}
-        self.partial_signature      = []
-        self.rand_partial_signature = []
-        self.message                = message
-        #setup the nodes 
-        self.sample_polynomials()
-        self.calculate_commitment()
+    def __init__(self, node_id, public_parameters, threshold, message, index):
+        self.node_id                   = node_id
+        self.public_parameters         = public_parameters
+        self.threshold                 = threshold
 
-    
+        self.f_poly                    = None
+        self.g_poly                    = None
+        self.commitments               = None
+        self.received_commitments      = {}
+        self.received_commitments_rand = {}
+        self.received_shares           = {}
+        self.received_shares_rand      = {}
+        
+
+        self.randomizer                = []
+        self.randomizer_x              = None
+        self.randomizer_y              = None
+        self.partial_rand              = [] # (r_i0, r_i1)
+        self.partial_rand_pt           = [] # (g2^{r_i0}, g2^{r_i0})
+ 
+        self.partial_secret_key        = []   # (x_i, y_i)
+        self.partial_ver_key           = []   # (g2^{x_i}, g2^{y_i})
+ 
+        self.partial_secret_key_prime  = []   # (x_i + r0, y_i + r1)
+        self.partial_ver_key_prime     = []   # (g2^{x_i + r0}, g2^{y_i + r1})
+ 
+        self.partial_signature         = []   # (h, s_i)
+        self.rand_partial_signature    = []   # (h, s'_i)
+ 
+        self.message                   = message
+        self.index                     = index
+
+
     def sample_polynomials(self):
-        # polynomials represented in increasing order
-        # i.e. f_poly[0] = f[0]
-        self.f_poly = [randint(0, self.public_parameters['p'] - 1) for _ in range(self.threshold + 1)]
-        self.g_poly = [randint(0, self.public_parameters['p'] - 1) for _ in range(self.threshold + 1)]
+        p = self.public_parameters['p']
+        # Each polynomial has length = threshold => degree = threshold - 1
+        first_poly = [randint(0, p - 1) for _ in range(self.threshold)]
+        second_poly = [randint(0, p - 1) for _ in range(self.threshold)]
+        return first_poly, second_poly
 
-    def calculate_commitment(self):
-        B = []
-        C = []
-
-        for i in range(len(self.f_poly)):
-            B.append(scalar_mult(self.f_poly[i], self.public_parameters['g2'], default_ec_twist, Fq2))
-            assert B[i].is_on_curve()
-            C.append(scalar_mult(self.g_poly[i], self.public_parameters['g2'], default_ec_twist, Fq2))
-            assert C[i].is_on_curve()
-        
-        self.commitments = {
-            "B" : B,
-            "C" : C
-        }
-    
-    def calculate_commitment_sum(self, commitment):
-        sum_B = G2Infinity().to_affine()
-        sum_C = G2Infinity().to_affine()
-
-        B = commitment['B']
-        C = commitment['C']
-
-        for l in range(len(B)):
-                addend = scalar_mult(((self.node_id)**l), B[l], default_ec_twist, Fq2)
-                sum_B  = add_points(sum_B, addend, default_ec_twist, Fq2)
-        
-        for l in range(len(C)):
-                addend = scalar_mult(((self.node_id)**l), C[l], default_ec_twist, Fq2)
-                sum_C  = add_points(sum_C, addend, default_ec_twist, Fq2)
-        return sum_B, sum_C
 
     def eval_poly(self, poly_coefficients, var):
         """
-        Evaluate the polynomial f(x) = a0 + a1*x + a2*x^2 + ... + an*x^n
-        at x = `var`, where the constant term (a0) is added directly without
-        being multiplied by `var` and coeffiecents of polynomial represented
-        in increasing order
+        Evaluate polynomial sum_{i=0}^{t-1} poly[i] * var^i (mod p).
         """
-        total = 0
         p = self.public_parameters['p']
-
+        total = 0
         for power, coeff in enumerate(poly_coefficients):
-            if power == 0:
-                # Add the constant term directly
-                total = (total + coeff) % p
-            else:
-                # Add the term with the variable (coeff * var^power) mod p
-                total = (total + coeff * pow(var, power, p)) % p
-    
+            total = (total + coeff * pow(var, power, p)) % p
         return total
-    
-    def share_values(self, receiver_id):
 
-        f_val = self.eval_poly(self.f_poly, receiver_id)
-        g_val = self.eval_poly(self.g_poly, receiver_id)
-        shares = [f_val, g_val]
-
-        return shares, self.commitments
-    
-    def receive_data(self, sender_id, receiver_id, share_value, commitment_value):
+    def calculate_commitment(self, first_poly, second_poly):
         """
-        Store the data in this node's dictionaries.
-        We explicitly keep track of both sender_id and receiver_id in the key.
+        For each coefficient in f_poly, g_poly, commit in G2.
         """
-        key                            = (sender_id, receiver_id)
-        self.received_shares[key]      = share_value
-        self.received_commitments[key] = commitment_value
-    
-    def consistency_check(self):
-        compaints = []
-        for (sender_id, receiver_id) in self.received_shares:
-            
-            share_val  = self.received_shares[(sender_id, receiver_id)]
-            lhs_B = scalar_mult(share_val[0], self.public_parameters['g2'], default_ec_twist, Fq2)
-            lhs_C = scalar_mult(share_val[1], self.public_parameters['g2'], default_ec_twist, Fq2)
+        B = []
+        C = []
+        ec_twist = default_ec_twist
+        field_mod = Fq2
+        for i in range(len(first_poly)):  # which is `threshold`
+            B_i = scalar_mult(first_poly[i], self.public_parameters['g2'], ec_twist, field_mod)
+            C_i = scalar_mult(second_poly[i], self.public_parameters['g2'], ec_twist, field_mod)
+            B.append(B_i)
+            C.append(C_i)
+        commitments = {"B": B, "C": C}
+        return commitments
 
-            commitment = self.received_commitments[(sender_id, receiver_id)]
+    def calculate_commitment_sum(self, commitment):
+        """
+        sum_{l} (node_id^l * B[l]), sum_{l} (node_id^l * C[l]) in G2
+        """
+        sum_B = G2Infinity().to_affine()
+        sum_C = G2Infinity().to_affine()
+        ec_twist = default_ec_twist
+        field_mod = Fq2
+
+        B = commitment['B']
+        C = commitment['C']
+        for l in range(len(B)):
+            addend_B = scalar_mult(pow(self.node_id, l), B[l], ec_twist, field_mod)
+            sum_B    = add_points_ec(sum_B, addend_B, ec_twist, field_mod)
+        for l in range(len(C)):
+            addend_C = scalar_mult(pow(self.node_id, l), C[l], ec_twist, field_mod)
+            sum_C    = add_points_ec(sum_C, addend_C, ec_twist, field_mod)
+
+        return sum_B, sum_C
+
+    def share_values(self, receiver_id, isRand):
+        """
+        Evaluate polynomials f, g at `receiver_id`. Return (f(receiver_id), g(receiver_id)).
+        """
+        if not isRand:
+            first_val  = self.eval_poly(self.f_poly, receiver_id)
+            second_val = self.eval_poly(self.g_poly, receiver_id)
+            commit_val = self.commitments
+        else:
+            first_val = self.eval_poly(self.randomizer_x, receiver_id)
+            second_val = self.eval_poly(self.randomizer_y, receiver_id)
+            commit_val = self.randomizer
+        return [first_val, second_val], commit_val
+
+    def receive_data(self, sender_id, receiver_id, share_value, commitment_value, isRand):
+        key = (sender_id, receiver_id)
+        if not isRand:
+            self.received_shares[key] = share_value
+            self.received_commitments[key] = commitment_value
+        else:
+            self.received_shares_rand[key]      = share_value
+            self.received_commitments_rand[key] = commitment_value
+
+    def consistency_check(self, isRand):
+        """
+        Check g2^{f_val} = polynomialCommitment for each share.
+        If mismatch => complaint.
+        """
+        complaints = []
+        ec_twist = default_ec_twist
+        field_mod = Fq2
+        
+        if not isRand:
+            received_shares      = self.received_shares
+            received_commitments = self.received_commitments
+        else:
+            received_shares      = self.received_shares_rand
+            received_commitments = self.received_commitments_rand
+
+        for (sender_id, receiver_id) in received_shares:
+            share_val = received_shares[(sender_id, receiver_id)]
+            f_val, g_val = share_val
+            lhs_B = scalar_mult(f_val, self.public_parameters['g2'], ec_twist, field_mod)
+            lhs_C = scalar_mult(g_val, self.public_parameters['g2'], ec_twist, field_mod)
+
+            commitment   = received_commitments[(sender_id, receiver_id)]
             sum_B, sum_C = self.calculate_commitment_sum(commitment)
-            
-            result = isEqual(lhs_B, sum_B) and isEqual(lhs_C, sum_C)
-            if(result != True):
-               print("Non consistent share, a complaint will be issued.")
-               compaints.append(sender_id)
-        print("chech ended")
-        return compaints   
-    
-    def calculate_partial_keys(self):
-        partial_key_x = 0
-        partial_key_y = 0
 
-        for share in self.received_shares.values():
-            partial_key_x += share[0]
-            partial_key_y += share[1]
-        self.partial_sk = [partial_key_x % self.public_parameters['p'], partial_key_y % self.public_parameters['p']]
+            if not (isEqual(lhs_B, sum_B) and isEqual(lhs_C, sum_C)):
+                print(f"Node {self.node_id}: Inconsistent share from {sender_id}")
+                complaints.append(sender_id)
+        return complaints
+
+    def calculate_partial_keys(self, isRand):
+        """
+        sum_{all senders} f_val => x_i, sum_{all senders} g_val => y_i
+        partial_ver_key = sums of commitments
+        """
+        p = self.public_parameters['p']
+        ec_twist = default_ec_twist
+        field_mod = Fq2
+
+        if not isRand:
+            received_shares      = self.received_shares
+            received_commitments = self.received_commitments
+        else:
+            received_shares      = self.received_shares_rand
+            received_commitments = self.received_commitments_rand
+
+        x_i = 0
+        y_i = 0
+        for share_val in received_shares.values():
+            x_i = (x_i + share_val[0]) % p
+            y_i = (y_i + share_val[1]) % p
+        partial_result_val = [x_i, y_i]
 
         sum_B = G2Infinity().to_affine()
         sum_C = G2Infinity().to_affine()
-        for commitment in self.received_commitments.values():
-            sum_Bj, sum_Cj = self.calculate_commitment_sum(commitment)
-            sum_B += sum_Bj
-            sum_C += sum_Cj
-        self.partial_vk = [sum_B, sum_C]
-        return
-    
-    def rand_sk_share(self):
-        self.partial_sk_prime.append(self.partial_sk[0] + self.rho[0])
-        self.partial_sk_prime.append(self.partial_sk[1] + self.rho[1])
-        return
-    
-    def rand_pk_share(self):
-        self.partial_vk_prime.append(add_points(self.partial_vk[0], self.point_exp_rho[0], default_ec_twist, Fq2))
-        self.partial_vk_prime.append(add_points(self.partial_vk[1], self.point_exp_rho[1], default_ec_twist, Fq2))
-        return
-    
-    def hash_string_to_G1(self, node_id) -> AffinePoint:
-        result = G1Generator()
-        #using hash-to-curve from py_ecc library
-        #cipher_suit for hash-to-curve
-        DST_G1 = b"QUUX-V01-CS02-with-BLS12381G1_XMD:SHA-256_SSWU_RO_"
-        node_id_str = bytearray(node_id)
-        id_converted_point = hash_to_G1(node_id_str, DST_G1, sha256)
-        id_converted_point_x = id_converted_point[0] / id_converted_point[2] 
-        id_converted_point_y = id_converted_point[1] / id_converted_point[2]
+        for commitment in received_commitments.values():
+            sb, sc = self.calculate_commitment_sum(commitment)
+            sum_B  = add_points_ec(sum_B, sb, ec_twist, field_mod)
+            sum_C  = add_points_ec(sum_C, sc, ec_twist, field_mod)
+        partial_result_pt = [sum_B, sum_C]
 
-        #convert the result from py_ecc library
-        fq_point_x = Fq(q, int(id_converted_point_x))
-        fq_point_y = Fq(q, int(id_converted_point_y))
-        result_affine_point = AffinePoint(fq_point_x, fq_point_y, False, ec=default_ec)
-        result_is_on_curve = result_affine_point.is_on_curve()
-        if(result_is_on_curve == True):
-            result = result_affine_point   
-        return result
-    
-    def indexed_message_encoding(self):
-        h = self.hash_string_to_G1(self.node_id)
-
-        #convert message to integer
-        m  = int.from_bytes((hash256(self.message) + hash256(self.message)[16:]), byteorder="big")
-        M1 = scalar_mult(m, h, default_ec, Fq)
-        M2 = scalar_mult(m, self.public_parameters['g2'], default_ec_twist, Fq2)
-        
-        self.indexed_message = {
-            "node_id" : self.node_id,
-            "h" : h,
-            "M1" : M1,
-            "M2" : M2
-        }
-
+        if not isRand:
+            self.partial_secret_key = partial_result_val
+            self.partial_ver_key    = partial_result_pt
+        else:
+            self.partial_rand    = partial_result_val
+            self.partial_rand_pt = partial_result_pt
         return
-    
-    def partial_sign_gen(self, public_parameters, partial_secret_key, indexed_message):
-        sigma = []
-        #check consistency
+
+    ########################################################################
+    # Randomizing partial key: single (r_0, r_1) for all nodes
+    ########################################################################
+
+    def rand_secret_key_share(self):
+        """
+        partial_secret_key_prime = (x_i + r_0, y_i + r_1)
+        """
+        p = self.public_parameters['p']
+        x_prime = (self.partial_secret_key[0] + self.partial_rand[0]) % p
+        y_prime = (self.partial_secret_key[1] + self.partial_rand[1]) % p
+        self.partial_secret_key_prime = [x_prime, y_prime]
+
+    def rand_public_key_share(self):
+        """
+        partial_ver_key_prime = ( g2^{x_i} * g2^{r_0}, g2^{y_i} * g2^{r_1} )
+        """
+        ec_twist = default_ec_twist
+        field_mod = Fq2
+
+        # original partial VK = (vk_i0, vk_i1)
+        vk_i0 = self.partial_ver_key[0]
+        vk_i1 = self.partial_ver_key[1]
+
+        vk0_prime = add_points_ec(self.partial_ver_key[0], self.partial_rand_pt[0], ec_twist, field_mod)
+        vk1_prime = add_points_ec(self.partial_ver_key[1], self.partial_rand_pt[1], ec_twist, field_mod)
+
+        self.partial_ver_key_prime = [vk0_prime, vk1_prime]
+
+    ########################################################################
+    # Partial Sign & Adapt
+    ########################################################################
+
+    def partial_sign_gen(self, indexed_message):
+        """
+        sigma_i = (h, h^{x_i} * M1^{y_i})
+        """
+        ec = default_ec
+        field_mod = Fq
         h  = indexed_message['h']
         M1 = indexed_message['M1']
         M2 = indexed_message['M2']
-        lhs = ate_pairing(h.to_jacobian(), M2.to_jacobian(), default_ec)
-        rhs = ate_pairing(M1.to_jacobian(), public_parameters['g2'].to_jacobian(), default_ec)
+
+        # iDH check
+        lhs = ate_pairing(h.to_jacobian(), M2.to_jacobian(), ec)
+        rhs = ate_pairing(M1.to_jacobian(), self.public_parameters['g2'].to_jacobian(), ec)
         if lhs != rhs:
-            #abort
-            print(f"PSignKen has failed.")
-        
-        first_addend  = scalar_mult(partial_secret_key[0], h, default_ec, Fq)
-        second_addend = scalar_mult(partial_secret_key[1], M1, default_ec, Fq)
-        addition_result = add_points(first_addend, second_addend, default_ec, Fq)
+            print(f"Node {self.node_id} partial_sign_gen fails iDH check.")
+            self.partial_signature = []
+            return
 
-        sigma.append(h)
-        sigma.append(addition_result)
+        x_i = self.partial_secret_key[0]
+        y_i = self.partial_secret_key[1]
+        p1  = scalar_mult(x_i, h, ec, field_mod)
+        p2  = scalar_mult(y_i, M1, ec, field_mod)
+        s_i = add_points_ec(p1, p2, ec, field_mod)
 
-        self.partial_signature = sigma
-        return
+        self.partial_signature = [h, s_i]
 
-    def adapt(self, public_parameters, indexed_message, partial_signature, randomizer, partial_secret_key):
-        #TODO do we need all parameters except rho and sk_i'
-        self.rand_partial_signature.append(partial_signature[0])
+    def adapt(self, indexed_message):
+        """
+        sigma'_i = (h, h^{x_i + r_0} * M1^{y_i + r_1})
+        """
+        if len(self.partial_signature) < 2:
+            return
+        ec = default_ec
+        field_mod = Fq
+        h  = indexed_message['h']
+        M1 = indexed_message['M1']
 
-        h    = indexed_message['h']
-        M1   = indexed_message['M1']
-        tmp1 = scalar_mult(partial_secret_key[0], h, default_ec, Fq)
-        tmp2 = scalar_mult(partial_secret_key[1], M1, default_ec, Fq)
-        tmp = add_points(tmp1, tmp2, default_ec, Fq)
-        self.rand_partial_signature.append(tmp)
+        x_prime = self.partial_secret_key_prime[0]
+        y_prime = self.partial_secret_key_prime[1]
 
-        return
+        part1 = scalar_mult(x_prime, h, ec, field_mod)
+        part2 = scalar_mult(y_prime, M1, ec, field_mod)
+        s_adapted = add_points_ec(part1, part2, ec, field_mod)
 
-    def partial_sign_verify(self, public_parameters, partial_verification_key, M1, M2, rand_partial_signature):
-        h = rand_partial_signature[0]
-        s = rand_partial_signature[1]
+        self.rand_partial_signature = [h, s_adapted]
 
-        res1 = isEqual(h, G1Infinity().to_affine())
-        res2 = isEqual(M1, G1Infinity().to_affine())
-        res3 = ate_pairing(h.to_jacobian() , M2.to_jacobian(), default_ec) == \
-               ate_pairing(M1.to_jacobian(), public_parameters['g2'].to_jacobian(), default_ec)
-        res4 = add_points(ate_pairing(h.to_jacobian(), partial_verification_key[0].to_jacobian(), default_ec),\
-                          ate_pairing(M1.to_jacobian(), partial_verification_key[1].to_jacobian(), default_ec),\
-                          default_ec, Fq12) == ate_pairing(s.to_jacobian(), public_parameters['g2'].to_jacobian(), default_ec)
-        
-        if res1 and res2 and res3 and res4:
-            return True
-        else:
+    def partial_sign_verify(self, indexed_message):
+        """
+        Check e(h, M2) = e(M1, g2) and e(h, vk'_i0)* e(M1,vk'_i1) = e(rand_partial_signature[1], g2)
+        """
+        if len(self.rand_partial_signature) < 2:
+            print(f"Node {self.node_id} partial_sign_verify fails: no signature.")
             return False
 
-def distribute_shares(nodes):
+        ec = default_ec
+        h, s_prime = self.rand_partial_signature
+        M1 = indexed_message['M1']
+        M2 = indexed_message['M2']
+
+        if h == G1Infinity().to_affine():
+            print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
+            return False
+        
+        if M1 == G1Infinity().to_affine():
+            print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
+            return False
+
+        # 1) iDH check
+        lhs_1 = ate_pairing(h.to_jacobian(), M2.to_jacobian(), ec)
+        rhs_1 = ate_pairing(M1.to_jacobian(), self.public_parameters['g2'].to_jacobian(), ec)
+        if lhs_1 != rhs_1:
+            print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
+            return False
+
+        # 2) e(h, vk'_{i0}) * e(M1, vk'_{i1}) == e(s_prime, g2)
+        lhs_2_1 = ate_pairing(h.to_jacobian(), self.partial_ver_key_prime[0].to_jacobian(), ec)
+        lhs_2_2 = ate_pairing(M1.to_jacobian(), self.partial_ver_key_prime[1].to_jacobian(), ec)
+        lhs_2   = lhs_2_1.__mul__(lhs_2_2)
+        rhs_2   = ate_pairing(s_prime.to_jacobian(), self.public_parameters['g2'].to_jacobian(), ec)
+        if lhs_2 != rhs_2:
+            print(f"Node {self.node_id} partial_sign_verify fails final pairing mismatch.")
+            return False
+
+        return True
+
+def test_randomizer(nodes, threshold, p):
     """
-    Simulate sending and receiving shares among all nodes.
-    Each node i sends share_values(i->j) to node j.
+    Demonstrate that any subset of size `threshold` can reconstruct the same
+    global randomizer (X, Y) via Lagrange interpolation of the global polynomials' shares.
     """
-    
+    # 1) The true global randomizer from summing polynomials
+    global_rand = get_global_randomizer(nodes)
+    print(f"[TEST] Global randomizer (expected) = {global_rand}")
+
+    # 2) Build the "global polynomials" by summing node randomizers
+    length = threshold
+    all_x = [node.randomizer_x for node in nodes]
+    all_y = [node.randomizer_y for node in nodes]
+    Gx = sum_polynomials(all_x, length, p)
+    Gy = sum_polynomials(all_y, length, p)
+
+    # 3) Each node i's share = (i, Gx(i)), (i, Gy(i))
+    node_shares_x = [(node.node_id, eval_polynomial(Gx, node.node_id, p)) for node in nodes]
+    node_shares_y = [(node.node_id, eval_polynomial(Gy, node.node_id, p)) for node in nodes]
+
+    # 4) Pick a few subsets of size `threshold` and reconstruct
+    import itertools
+    subsets = list(itertools.combinations(nodes, threshold))
+    # limit to e.g. 5 for brevity
+    subsets = subsets[:5]
+
+    for s in subsets:
+        subset_ids = [n.node_id for n in s]
+        sx = [(i, val) for (i, val) in node_shares_x if i in subset_ids]
+        sy = [(i, val) for (i, val) in node_shares_y if i in subset_ids]
+        # reconstruct
+        X_recon = lagrange_interpolate_zero(sx, p)
+        Y_recon = lagrange_interpolate_zero(sy, p)
+        print(f"  Subset {subset_ids} => reconstructed randomizer = ({X_recon}, {Y_recon})")
+
+    print("Done testing randomizer.\n")
+
+
+##############################################################################
+# Distribute main key shares
+##############################################################################
+
+def distribute_shares(nodes, isRand=False):
     for sender in nodes:
         for receiver in nodes:
-                #nodelar kendilerine de share hesaplayacak
-                share_val, commit_val = sender.share_values(receiver.node_id)
-                receiver.receive_data(sender.node_id, receiver.node_id, share_val, commit_val)
+            share_val, commit_val = sender.share_values(receiver.node_id, isRand)
+            receiver.receive_data(sender.node_id, receiver.node_id, share_val, commit_val, isRand)
+
+def remove_nodes_above_threshold(nodes, complaints, threshold):
+    return [node for node in nodes if complaints.get(node.node_id, 0) <= threshold]
+
+def issue_complaints(complaints, c_list):
+    for node_id in c_list:
+        complaints[node_id] = complaints.get(node_id, 0) + 1
+
+def calculate_global_verification_key(nodes, public_parameters, isRand):
+    """
+    Summation of f_poly[0] => x, g_poly[0] => y,
+    then vk = (g2^x, g2^y)
+    """
+    p = public_parameters['p']
+    x_agg = 0
+    y_agg = 0
+
+    for node in nodes:
+        x_agg = (x_agg + (node.f_poly[0] if not isRand else node.randomizer_x[0])) % p
+        y_agg = (y_agg + (node.g_poly[0] if not isRand else node.randomizer_y[0])) % p
+    ec_twist = default_ec_twist
+    field_mod = Fq2
+    vk0 = scalar_mult(x_agg, public_parameters['g2'], ec_twist, field_mod)
+    vk1 = scalar_mult(y_agg, public_parameters['g2'], ec_twist, field_mod)
+    return [vk0, vk1]
+
+def key_gen(nodes, public_parameters, threshold, isRand=False):
+    """
+    1) Distribute shares
+    2) Consistency checks
+    3) Drop any node with too many complaints
+    4) Each node sums up its shares => partial (x_i, y_i)
+    5) global_ver_key = (g2^{x}, g2^{y})
+    """
+    complaints = {nid:0 for nid in range(1, len(nodes)+1)}
+    for node in nodes:
+        first_poly, second_poly = node.sample_polynomials()
+        commitments = node.calculate_commitment(first_poly, second_poly)
+        if not isRand:
+            node.f_poly = first_poly
+            node.g_poly = second_poly
+            node.commitments = commitments
+        else:
+            node.randomizer_x = first_poly
+            node.randomizer_y = second_poly
+            node.randomizer = commitments
+
+    distribute_shares(nodes, isRand)
+
+    for node in nodes:
+        c_list = node.consistency_check(isRand)
+        issue_complaints(complaints, c_list)
+
+    nodes_ok = remove_nodes_above_threshold(nodes, complaints, threshold)
+
+    for node in nodes_ok:
+        node.calculate_partial_keys(isRand)
+
+    global_vk = calculate_global_verification_key(nodes_ok, public_parameters, isRand)
+    return nodes_ok, global_vk
+
+
+##############################################################################
+# Randomizer for All Nodes
+##############################################################################
+
+def rand_gen(nodes, ppublic_parameters, threshold):
+    """
+    Each node generates random polynomials randomizer_x, randomizer_y
+    of degree threshold-1. Called by each node.
+    """
+    isRand = True
+    nodes, global_randomizer = key_gen(nodes, public_parameters, threshold, isRand)
+
+    return nodes
+
+def rand_pk(global_ver_key, r_0, r_1, public_parameters):
+    """
+    vk' = ( g2^{x} * g2^{r_0},  g2^{y} * g2^{r_1} )
+    """
+    ec_twist = default_ec_twist
+    field_mod = Fq2
+    vk0, vk1 = global_ver_key[0], global_ver_key[1]
+
+    add_r0 = scalar_mult(r_0, public_parameters['g2'], ec_twist, field_mod)
+    add_r1 = scalar_mult(r_1, public_parameters['g2'], ec_twist, field_mod)
+
+    vk0_prime = add_points_ec(vk0, add_r0, ec_twist, field_mod)
+    vk1_prime = add_points_ec(vk1, add_r1, ec_twist, field_mod)
+    return [vk0_prime, vk1_prime]
+
+
+##############################################################################
+# Indexed Message / Hash-to-G1
+##############################################################################
+
+def hash_string_to_G1(i: int) -> AffinePoint:
+    DST_G1 = b"QUUX-V01-CS02-with-BLS12381G1_XMD:SHA-256_SSWU_RO_"
+    idx_bytes = i.to_bytes(4, 'big')
+    pt3d = hash_to_G1(idx_bytes, DST_G1, sha256)
+    x_coord = pt3d[0] / pt3d[2]
+    y_coord = pt3d[1] / pt3d[2]
+    fqx = Fq(q, int(x_coord))
+    fqy = Fq(q, int(y_coord))
+    aff_pt = AffinePoint(fqx, fqy, False, ec=default_ec)
+    if not aff_pt.is_on_curve():
+        raise ValueError("Hash-to-curve point not on curve.")
+    return aff_pt
+
+def indexed_message_encoding(public_parameters, message, index):
+    """
+    M1 = H(id)^m, M2 = g2^m, h = H(id).
+    """
+    h = hash_string_to_G1(index)
+    full_hash = hash256(message) + hash256(message)[16:]
+    m = int.from_bytes(full_hash, "big")
+
+    ec = default_ec
+    ec_twist = default_ec_twist
+    field1 = Fq
+    field2 = Fq2
+    M1 = scalar_mult(m, h, ec, field1)
+    M2 = scalar_mult(m, public_parameters['g2'], ec_twist, field2)
+    return {
+        "id": index,
+        "h":  h,
+        "M1": M1,
+        "M2": M2
+    }
+
+
+##############################################################################
+# DKG-style Randomizer Utilities
+##############################################################################
+
+def sum_polynomials(poly_list, length, p):
+    """
+    Given a list of polynomials (each is length `length`),
+    return their sum mod p, also length `length`.
+    """
+    result = [0]*length
+    for poly in poly_list:
+        for i in range(length):
+            result[i] = (result[i] + poly[i]) % p
+    return result
+
+def eval_polynomial(coeffs, x, p):
+    """
+    Evaluate polynomial with given coefficients at x mod p.
+    coeffs[i] is the coefficient of x^i.
+    """
+    total = 0
+    power = 1
+    for c in coeffs:
+        total = (total + c * power) % p
+        power = (power * x) % p
+    return total
+
+def lagrange_interpolate_zero(shares, p):
+    """
+    Reconstruct f(0) from a list of (x_i, f(x_i)) using standard Lagrange interpolation mod p.
+    """
+    total = 0
+    for i, (x_i, y_i) in enumerate(shares):
+        numerator = 1
+        denominator = 1
+        for j, (x_j, _) in enumerate(shares):
+            if j != i:
+                numerator = (numerator * (-x_j % p)) % p
+                denominator = (denominator * (x_i - x_j) % p) % p
+        denom_inv = pow(denominator, p-2, p)
+        term = (y_i * numerator) % p
+        term = (term * denom_inv) % p
+        total = (total + term) % p
+    return total
+
+def get_global_randomizer(subset_T):
+    """
+    Computes the "global" polynomials Gx, Gy by summing each node's randomizer_x, randomizer_y.
+    Then the global secret randomizer = (Gx(0), Gy(0)).
+    """
+    if not subset_T:
+        return None
+    h = indexed_msg['h']
+    ec = default_ec_twist
+    field_mod = Fq2
+
+    # 2) Aggregate using Lagrange interpolation w.r.t. node IDs
+    r0_agg = 0
+    r1_agg = 0
+    subset_ids = [node.node_id for node in subset_T]
+    for node in subset_T:
+        r_i0, r_i1 = node.partial_rand
+        lam_i = get_lagrange_coefficient(node.node_id, subset_ids, public_parameters['p'])
+        contrib_r0 = (lam_i * r_i0) % public_parameters['p'] 
+        contrib_r1 = (lam_i * r_i1) % public_parameters['p']
+        r0_agg   = (r0_agg + contrib_r0) % public_parameters['p']
+        r1_agg   = (r1_agg + contrib_r1) % public_parameters['p']
+
+    return (r0_agg, r1_agg)
+
+
+
+##############################################################################
+# Reconstruct the final signature from subset T
+##############################################################################
+
+def reconst_signature(subset_T, public_parameters, indexed_msg):
+    """
+    sigma' = (h, ∑_{i in T} lambda_i * s'_i ).
+    We use node IDs for Lagrange interpolation over partial signatures.
+    """
+    if not subset_T:
+        return None
+    h = indexed_msg['h']
+    ec = default_ec
+    field_mod = Fq
+
+    # 1) Verify each partial signature from subset_T
+    for node in subset_T:
+        ok = node.partial_sign_verify(indexed_msg)
+        if not ok:
+            print(f"Node {node.node_id} partial signature verify fails.")
+            return None
+
+    # 2) Aggregate using Lagrange interpolation w.r.t. node IDs
+    s_agg = G1Infinity().to_affine()
+    subset_ids = [node.node_id for node in subset_T]
+    for node in subset_T:
+        h_i, s_i_prime = node.rand_partial_signature
+        lam_i = get_lagrange_coefficient(node.node_id, subset_ids, public_parameters['p'])
+        contrib = scalar_mult(lam_i, s_i_prime, ec, field_mod)
+        s_agg   = add_points_ec(s_agg, contrib, ec, field_mod)
+
+    return [h, s_agg]
+
+
+def verify_signature(public_parameters, vk_prime, indexed_msg, signature):
+    """
+    Final check: e(h, M2) == e(M1, g2) and e(h, vk'_0)* e(M1, vk'_1) == e(s', g2)
+    """
+    if not signature or len(signature) < 2:
+        return False
+    h, s_agg = signature
+    M1 = indexed_msg['M1']
+    M2 = indexed_msg['M2']
+
+    if h == G1Infinity().to_affine():
+        return False
+        
+    if M1 == G1Infinity().to_affine():
+        return False
+
+    ec = default_ec
+
+    # 3) iDH check
+    lhs_1 = ate_pairing(h.to_jacobian(), M2.to_jacobian(), ec)
+    rhs_1 = ate_pairing(M1.to_jacobian(), public_parameters['g2'].to_jacobian(), ec)
+    if lhs_1 != rhs_1:
+        return False
+
+    # 4) final pairing check
+    tmp1 = ate_pairing(h.to_jacobian(), vk_prime[0].to_jacobian(), ec)
+    tmp2 = ate_pairing(M1.to_jacobian(), vk_prime[1].to_jacobian(), ec)
+    lhs_2   = tmp1.__mul__(tmp2)
+    rhs_2   = ate_pairing(s_agg.to_jacobian(), public_parameters['g2'].to_jacobian(), ec)
+    return (lhs_2 == rhs_2)
 
 def setup(total_participant, threshold, message):
     #generators
@@ -264,137 +670,74 @@ def setup(total_participant, threshold, message):
     public_parameters = {
             "g1" : g1,
             "g2" : g2,
-            "q" : q,
-            "p" : n
+            "q" : q, 
+            "p" : n # order og G1, G2 and GT
         }
     #init Nodes
-    nodes = [Node(i, public_parameters, threshold, message) for i in range(1, total_participant + 1)]
+    nodes = [Node(i, public_parameters, threshold, message, index) for i in range(1, total_participant + 1)]
     return nodes, public_parameters
 
-def isEqual(pointA, pointB)-> bool:
-        if not isinstance(pointA, AffinePoint):
-            return False
-        if not isinstance(pointB, AffinePoint):
-            return False
-        return (
-            pointA.x == pointB.x and pointA.y == pointB.y and pointA.infinity == pointB.infinity
-        )
 
-def issue_complaints(complaints, complaint_list):
-    for node_id in complaint_list:
-        if node_id in complaints:
-            complaints[node_id] += 1
-        else:
-            print(f"Warning: Node ID {node_id} not found in the compaints dictionary.")
-
-# Function to remove nodes based on complaint threshold
-def remove_nodes_above_threshold(nodes, complaints, threshold):
-    """
-    Remove nodes from the list if the number of complaints against their node_id exceeds the threshold.
-    :param nodes: List of Node instances.
-    :param complaints: Dictionary of complaints.
-    :param threshold: Maximum allowed complaints before removal.
-    :return: Updated list of nodes.
-    """
-    return [node for node in nodes if complaints.get(node.node_id, 0) <= threshold]
-
-def calculate_global_verification_key(nodes, public_parameters):
-    """
-    Calculate the global keys vk_00 and vk_01 by summing the f_poly[0] and g_poly[0] values of all nodes.
-    :param nodes: List of Node instances.
-    :return: A list [vk_00, vk_01] where:
-             vk_00 is the sum of all node.f_poly[0],
-             vk_01 is the sum of all node.g_poly[0].
-    """
-    sk_0 = sum(node.f_poly[0] for node in nodes if node.f_poly)
-    sk_1 = sum(node.g_poly[0] for node in nodes if node.g_poly)
-    vk_00 = scalar_mult(sk_0, public_parameters['g2'], default_ec_twist, Fq2)
-    vk_01 = scalar_mult(sk_1, public_parameters['g2'], default_ec_twist, Fq2)
-    #do we need sk ? clarifiy TODO
-    vk = [vk_00, vk_01]
-    return vk
-
-def rand_gen(nodes, public_parameters):
-    r_x  = 0
-    r_y  = 0
-    p_rx = 0
-    p_ry = 0
-    for node in nodes:
-        r_x = randint(0, public_parameters['p'] - 1)
-        r_y = randint(0, public_parameters['p'] - 1)
-        p_rx = scalar_mult(r_x, public_parameters['g2'], default_ec_twist, Fq2)
-        p_ry = scalar_mult(r_y, public_parameters['g2'], default_ec_twist, Fq2)
-        node.rho = [r_x, r_y]
-        node.point_exp_rho = [p_rx, p_ry]
-    return
-
-def rand_pk(public_parameters, vk, rho):
-    vk_prime = []
-    point_exp_rho = []
-    point_exp_rho.append(scalar_mult(rho[0], public_parameters['g2'], default_ec_twist, Fq2))
-    point_exp_rho.append(scalar_mult(rho[1], public_parameters['g2'], default_ec_twist, Fq2))
-    vk_prime.append(add_points(vk[0], point_exp_rho[0], default_ec_twist, Fq2))
-    vk_prime.append(add_points(vk[1], point_exp_rho[1], default_ec_twist, Fq2))
-
-    return vk_prime
-
-def key_gen(nodes, public_parameters, total_participant, threshold):
-    
-    complaints = {node_id: 0 for node_id in range(1, total_participant + 1)}
-
-    distribute_shares(nodes)
-
-    for node in nodes:
-        complaint_list = node.consistency_check()
-
-    issue_complaints(complaints, complaint_list)
-    # If complaints against node_id > t, disqualify the node
-    nodes = remove_nodes_above_threshold(nodes, complaints, threshold)
-    for node in nodes:
-        node.qualified_node_count = len(nodes)
-
-    global_vk = calculate_global_verification_key(nodes, public_parameters)
-    sk = []
-    vk = []
-    for node in nodes:
-        node.calculate_partial_keys()
-        sk.append(node.partial_sk)
-        vk.append(node.partial_vk)
-    
-    rand_gen(nodes, public_parameters)
-
-    return sk, vk, global_vk
-
+##############################################################################
+# MAIN
+##############################################################################
 
 if __name__ == "__main__":
-    
-    security_param    = 128  # Security parameter
-    total_participant = 3  # Number of participants, n
-    threshold         = 2  # Threshold t
-    message           = b'Hello World'
+    total_participant = 5
+    threshold = 3
 
+    message = b"Hello World"
+    index   = len(message)
+
+    # 1) Setup
     nodes, public_parameters = setup(total_participant, threshold, message)
-    sk, vk, global_vk        = key_gen(nodes, public_parameters, total_participant, threshold)
+
+    # Encode the message + index => (h, M1, M2)
+    indexed_msg = indexed_message_encoding(public_parameters, message, index)
+
+    # (B) Existing threshold BLS KeyGen for (x,y).
+    nodes, global_vk = key_gen(nodes, public_parameters, threshold)
+
+    if len(nodes) < threshold:
+        print("Not enough valid nodes remain after complaints; aborting.")
+        exit(1)
+
+    # 3) RandGen (r_0, r_1)
+    nodes = rand_gen(nodes, public_parameters, threshold)
+
+    # ------------------------------------------------------------------------
+
+    # 4) Each node randomizes partial key + partial VK
     for node in nodes:
-        node.rand_sk_share()
-        node.rand_pk_share()
-        node.indexed_message_encoding()
-        node.partial_sign_gen(node.public_parameters, node.partial_sk, node.indexed_message)
-        node.adapt(node.public_parameters, node.indexed_message, node.partial_signature, node.rho , node.partial_sk)
-        node.partial_sign_verify(node.public_parameters, node.partial_vk_prime, node.indexed_message['M1'],\
-                                node.indexed_message['M2'], node.rand_partial_signature)
+        node.rand_secret_key_share()
+        node.rand_public_key_share()
 
+    # 5) Partial sign with original partial SK
+    for node in nodes:
+        node.partial_sign_gen(indexed_msg)
+
+    # 6) Adapt partial signature with the single (r_0, r_1)
+    for node in nodes:
+        node.adapt(indexed_msg)
+
+    # 7) Choose a subset T of size t
+    subset_T = sample(nodes, k=threshold)
     
-    #TODO what would be the calculation of rho
-    rho =[0, 0]
-    vk_prime = rand_pk(public_parameters, global_vk, rho)
+    # 8) Reconstruct final signature from subset T
+    signature = reconst_signature(subset_T, public_parameters, indexed_msg)
+    if not signature:
+        print("Signature reconstruction failed.")
+        exit(1)
 
+    # 9) Randomize the *global* VK => vk' = (g2^{x+r_0}, g2^{y+r_1})
+    global_rand = get_global_randomizer(subset_T)
+    vk_prime = rand_pk(global_vk, global_rand[0], global_rand[1], public_parameters)
 
-3
-print("Protocol Ends Here")
+    # 10) Verify
+    ok = verify_signature(public_parameters, vk_prime, indexed_msg, signature)
+    if ok:
+        print("✅  Signature verification PASSED.")
+    else:
+        print("❌  Signature verification FAILED.")
 
-
-
-
-
-
+    print("Done.")
