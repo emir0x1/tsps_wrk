@@ -10,7 +10,6 @@ from ec import ( default_ec, default_ec_twist, bytes_to_point,
                 G1FromBytes, G2FromBytes, point_to_bytes,
                 add_points, scalar_mult, AffinePoint)
 
-
 ##############################################################################
 # Helper functions
 ##############################################################################
@@ -79,9 +78,14 @@ class Node:
  
         self.partial_signature         = []   # (h, s_i)
         self.rand_partial_signature    = []   # (h, s'_i)
+
+        self.received_rand_signatures  = {}
+        self.received_ver_keys         = {}
  
         self.message                   = message
         self.index                     = index
+        self.indexed_msg               = None
+        self.received_indexed_msg      = {}
 
 
     def sample_polynomials(self):
@@ -260,18 +264,39 @@ class Node:
         self.partial_ver_key_prime = [vk0_prime, vk1_prime]
 
     ########################################################################
-    # Partial Sign & Adapt
+    # Index Message Encoding & Partial Sign & Adapt
     ########################################################################
 
-    def partial_sign_gen(self, indexed_message):
+    def indexed_message_encoding(self, public_parameters, message, index):
+        """
+        M1 = H(id)^m, M2 = g2^m, h = H(id).
+        """
+        h = hash_string_to_G1(index)
+        full_hash = hash256(message) + hash256(message)[16:]
+        m = int.from_bytes(full_hash, "big")
+
+        ec = default_ec
+        ec_twist = default_ec_twist
+        field1 = Fq
+        field2 = Fq2
+        M1 = scalar_mult(m, h, ec, field1)
+        M2 = scalar_mult(m, public_parameters['g2'], ec_twist, field2)
+        return {
+            "id": index,
+            "h":  h,
+            "M1": M1,
+            "M2": M2
+        }
+
+    def partial_sign_gen(self):
         """
         sigma_i = (h, h^{x_i} * M1^{y_i})
         """
         ec = default_ec
         field_mod = Fq
-        h  = indexed_message['h']
-        M1 = indexed_message['M1']
-        M2 = indexed_message['M2']
+        h  = self.indexed_msg['h']
+        M1 = self.indexed_msg['M1']
+        M2 = self.indexed_msg['M2']
 
         # iDH check
         lhs = ate_pairing(h.to_jacobian(), M2.to_jacobian(), ec)
@@ -289,7 +314,7 @@ class Node:
 
         self.partial_signature = [h, s_i]
 
-    def adapt(self, indexed_message):
+    def adapt(self):
         """
         sigma'_i = (h, h^{x_i + r_0} * M1^{y_i + r_1})
         """
@@ -297,8 +322,8 @@ class Node:
             return
         ec = default_ec
         field_mod = Fq
-        h  = indexed_message['h']
-        M1 = indexed_message['M1']
+        h  = self.indexed_msg['h']
+        M1 = self.indexed_msg['M1']
 
         x_prime = self.partial_secret_key_prime[0]
         y_prime = self.partial_secret_key_prime[1]
@@ -309,85 +334,57 @@ class Node:
 
         self.rand_partial_signature = [h, s_adapted]
 
-    def partial_sign_verify(self, indexed_message):
+    def partial_sign_verify(self):
         """
-        Check e(h, M2) = e(M1, g2) and e(h, vk'_i0)* e(M1,vk'_i1) = e(rand_partial_signature[1], g2)
-        """
-        if len(self.rand_partial_signature) < 2:
-            print(f"Node {self.node_id} partial_sign_verify fails: no signature.")
-            return False
+        For each entry with key (sender_id, receiver_id) and value (h, s_prime),
+        retrieve the sender's indexed message from self.received_indexed_msg[sender_id]
+        and perform the pairing check:
 
+             e(h_received, sender_msg["M2"]) ?= e(sender_msg["M1"], g2)
+
+        Returns True if all received signatures pass the check; otherwise returns False.
+        """
         ec = default_ec
-        h, s_prime = self.rand_partial_signature
-        M1 = indexed_message['M1']
-        M2 = indexed_message['M2']
+        # If there are no received random partial signatures, return True.
+        if not hasattr(self, "received_rand_signatures") or not self.received_rand_signatures:
+            return True
 
-        if h == G1Infinity().to_affine():
-            print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
-            return False
-        
-        if M1 == G1Infinity().to_affine():
-            print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
+        if not hasattr(self, "received_indexed_msg") or not self.received_indexed_msg:
+            print(f"Node {self.node_id}: No received indexed messages available.")
             return False
 
-        # 1) iDH check
-        lhs_1 = ate_pairing(h.to_jacobian(), M2.to_jacobian(), ec)
-        rhs_1 = ate_pairing(M1.to_jacobian(), self.public_parameters['g2'].to_jacobian(), ec)
-        if lhs_1 != rhs_1:
-            print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
-            return False
+        for key, signature in self.received_rand_signatures.items():
+            sender_id, _ = key  # key is (sender_id, receiver_id)
+            sender_msg = self.received_indexed_msg[(sender_id, self.node_id)]
+            sender_ver_key = self.received_ver_keys[(sender_id, self.node_id)]
+            h_received, s_received = signature
+            # Perform partial signature check the sender's indexed message.
+            if h_received == G1Infinity().to_affine():
+                print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
+                return False
+            
+            if sender_msg["M1"] == G1Infinity().to_affine():
+                print(f"Node {self.node_id} partial_sign_verify fails iDH check.")
+                return False
 
-        # 2) e(h, vk'_{i0}) * e(M1, vk'_{i1}) == e(s_prime, g2)
-        lhs_2_1 = ate_pairing(h.to_jacobian(), self.partial_ver_key_prime[0].to_jacobian(), ec)
-        lhs_2_2 = ate_pairing(M1.to_jacobian(), self.partial_ver_key_prime[1].to_jacobian(), ec)
-        lhs_2   = lhs_2_1.__mul__(lhs_2_2)
-        rhs_2   = ate_pairing(s_prime.to_jacobian(), self.public_parameters['g2'].to_jacobian(), ec)
-        if lhs_2 != rhs_2:
-            print(f"Node {self.node_id} partial_sign_verify fails final pairing mismatch.")
-            return False
-
+            lhs = ate_pairing(h_received.to_jacobian(), sender_msg["M2"].to_jacobian(), ec)
+            rhs = ate_pairing(sender_msg["M1"].to_jacobian(), self.public_parameters["g2"].to_jacobian(), ec)
+            if lhs != rhs:
+                print(f"Node {self.node_id}: Received random partial signature from sender {sender_id} failed verification on step 3.")
+                return False
+            
+            # 2) e(h, vk'_{i0}) * e(M1, vk'_{i1}) == e(s_prime, g2)
+            tmp1 = ate_pairing(h_received.to_jacobian(), sender_ver_key[0].to_jacobian(), ec)
+            tmp2 = ate_pairing(sender_msg["M1"].to_jacobian(), sender_ver_key[1].to_jacobian(), ec)
+            lhs   = tmp1.__mul__(tmp2)
+            rhs   = ate_pairing(s_received.to_jacobian(), self.public_parameters['g2'].to_jacobian(), ec)
+            if lhs != rhs:
+                print(f"Node {self.node_id}: Received random partial signature from sender {sender_id} failed verification on step 4.")
+                return False
         return True
 
-def test_randomizer(nodes, threshold, p):
-    """
-    Demonstrate that any subset of size `threshold` can reconstruct the same
-    global randomizer (X, Y) via Lagrange interpolation of the global polynomials' shares.
-    """
-    # 1) The true global randomizer from summing polynomials
-    global_rand = get_global_randomizer(nodes)
-    print(f"[TEST] Global randomizer (expected) = {global_rand}")
-
-    # 2) Build the "global polynomials" by summing node randomizers
-    length = threshold
-    all_x = [node.randomizer_x for node in nodes]
-    all_y = [node.randomizer_y for node in nodes]
-    Gx = sum_polynomials(all_x, length, p)
-    Gy = sum_polynomials(all_y, length, p)
-
-    # 3) Each node i's share = (i, Gx(i)), (i, Gy(i))
-    node_shares_x = [(node.node_id, eval_polynomial(Gx, node.node_id, p)) for node in nodes]
-    node_shares_y = [(node.node_id, eval_polynomial(Gy, node.node_id, p)) for node in nodes]
-
-    # 4) Pick a few subsets of size `threshold` and reconstruct
-    import itertools
-    subsets = list(itertools.combinations(nodes, threshold))
-    # limit to e.g. 5 for brevity
-    subsets = subsets[:5]
-
-    for s in subsets:
-        subset_ids = [n.node_id for n in s]
-        sx = [(i, val) for (i, val) in node_shares_x if i in subset_ids]
-        sy = [(i, val) for (i, val) in node_shares_y if i in subset_ids]
-        # reconstruct
-        X_recon = lagrange_interpolate_zero(sx, p)
-        Y_recon = lagrange_interpolate_zero(sy, p)
-        print(f"  Subset {subset_ids} => reconstructed randomizer = ({X_recon}, {Y_recon})")
-
-    print("Done testing randomizer.\n")
-
-
 ##############################################################################
-# Distribute main key shares
+# Distribute main key shares and signatures
 ##############################################################################
 
 def distribute_shares(nodes, isRand=False):
@@ -395,6 +392,16 @@ def distribute_shares(nodes, isRand=False):
         for receiver in nodes:
             share_val, commit_val = sender.share_values(receiver.node_id, isRand)
             receiver.receive_data(sender.node_id, receiver.node_id, share_val, commit_val, isRand)
+
+def distribute_rand_partial_signatures(subset_T):
+    for sender in subset_T:
+        for receiver in subset_T:
+            if not hasattr(receiver, "received_rand_signatures"):
+                receiver.received_rand_signatures = {}
+            receiver.received_rand_signatures[(sender.node_id, receiver.node_id)] = sender.rand_partial_signature
+            receiver.received_indexed_msg[(sender.node_id, receiver.node_id)]     = sender.indexed_msg
+            receiver.received_ver_keys[(sender.node_id, receiver.node_id)]        = sender.partial_ver_key_prime
+
 
 def remove_nodes_above_threshold(nodes, complaints, threshold):
     return [node for node in nodes if complaints.get(node.node_id, 0) <= threshold]
@@ -488,7 +495,7 @@ def rand_pk(global_ver_key, r_0, r_1, public_parameters):
 
 
 ##############################################################################
-# Indexed Message / Hash-to-G1
+# Hash-to-G1
 ##############################################################################
 
 def hash_string_to_G1(i: int) -> AffinePoint:
@@ -503,27 +510,6 @@ def hash_string_to_G1(i: int) -> AffinePoint:
     if not aff_pt.is_on_curve():
         raise ValueError("Hash-to-curve point not on curve.")
     return aff_pt
-
-def indexed_message_encoding(public_parameters, message, index):
-    """
-    M1 = H(id)^m, M2 = g2^m, h = H(id).
-    """
-    h = hash_string_to_G1(index)
-    full_hash = hash256(message) + hash256(message)[16:]
-    m = int.from_bytes(full_hash, "big")
-
-    ec = default_ec
-    ec_twist = default_ec_twist
-    field1 = Fq
-    field2 = Fq2
-    M1 = scalar_mult(m, h, ec, field1)
-    M2 = scalar_mult(m, public_parameters['g2'], ec_twist, field2)
-    return {
-        "id": index,
-        "h":  h,
-        "M1": M1,
-        "M2": M2
-    }
 
 
 ##############################################################################
@@ -578,9 +564,6 @@ def get_global_randomizer(subset_T):
     """
     if not subset_T:
         return None
-    h = indexed_msg['h']
-    ec = default_ec_twist
-    field_mod = Fq2
 
     # 2) Aggregate using Lagrange interpolation w.r.t. node IDs
     r0_agg = 0
@@ -597,25 +580,32 @@ def get_global_randomizer(subset_T):
     return (r0_agg, r1_agg)
 
 
-
 ##############################################################################
 # Reconstruct the final signature from subset T
 ##############################################################################
 
-def reconst_signature(subset_T, public_parameters, indexed_msg):
+def reconst_signature(subset_T, public_parameters):
     """
     sigma' = (h, ∑_{i in T} lambda_i * s'_i ).
     We use node IDs for Lagrange interpolation over partial signatures.
     """
     if not subset_T:
         return None
-    h = indexed_msg['h']
+
     ec = default_ec
     field_mod = Fq
 
     # 1) Verify each partial signature from subset_T
+    for node1 in subset_T:
+        for node2 in subset_T:
+            if node1.node_id != node2.node_id:
+                h1, _ = node1.rand_partial_signature
+                h2, _ = node2.rand_partial_signature
+                if h1 != h2:
+                    return False
+
     for node in subset_T:
-        ok = node.partial_sign_verify(indexed_msg)
+        ok = node.partial_sign_verify()
         if not ok:
             print(f"Node {node.node_id} partial signature verify fails.")
             return None
@@ -629,7 +619,7 @@ def reconst_signature(subset_T, public_parameters, indexed_msg):
         contrib = scalar_mult(lam_i, s_i_prime, ec, field_mod)
         s_agg   = add_points_ec(s_agg, contrib, ec, field_mod)
 
-    return [h, s_agg]
+    return [h_i, s_agg]
 
 
 def verify_signature(public_parameters, vk_prime, indexed_msg, signature):
@@ -663,7 +653,7 @@ def verify_signature(public_parameters, vk_prime, indexed_msg, signature):
     rhs_2   = ate_pairing(s_agg.to_jacobian(), public_parameters['g2'].to_jacobian(), ec)
     return (lhs_2 == rhs_2)
 
-def setup(total_participant, threshold, message):
+def setup(total_participant, threshold, message, index):
     #generators
     g1 = G1Generator(default_ec).to_affine()
     g2 = G2Generator(default_ec_twist).to_affine()
@@ -671,7 +661,8 @@ def setup(total_participant, threshold, message):
             "g1" : g1,
             "g2" : g2,
             "q" : q, 
-            "p" : n # order og G1, G2 and GT
+            "p" : n, # order og G1, G2 and GT
+            "id" : index
         }
     #init Nodes
     nodes = [Node(i, public_parameters, threshold, message, index) for i in range(1, total_participant + 1)]
@@ -685,53 +676,48 @@ def setup(total_participant, threshold, message):
 if __name__ == "__main__":
     total_participant = 5
     threshold = 3
-
     message = b"Hello World"
     index   = len(message)
 
     # 1) Setup
-    nodes, public_parameters = setup(total_participant, threshold, message)
-
-    # Encode the message + index => (h, M1, M2)
-    indexed_msg = indexed_message_encoding(public_parameters, message, index)
-
+    nodes, public_parameters = setup(total_participant, threshold, message, index)
     # (B) Existing threshold BLS KeyGen for (x,y).
     nodes, global_vk = key_gen(nodes, public_parameters, threshold)
-
     if len(nodes) < threshold:
         print("Not enough valid nodes remain after complaints; aborting.")
         exit(1)
-
     # 3) RandGen (r_0, r_1)
     nodes = rand_gen(nodes, public_parameters, threshold)
-
     # ------------------------------------------------------------------------
-
     # 4) Each node randomizes partial key + partial VK
     for node in nodes:
         node.rand_secret_key_share()
+    for node in nodes:
         node.rand_public_key_share()
-
     # 5) Partial sign with original partial SK
     for node in nodes:
-        node.partial_sign_gen(indexed_msg)
-
+        # Encode the message + index => (h, M1, M2)
+        node.indexed_msg = node.indexed_message_encoding(public_parameters, message, index)
+        node.partial_sign_gen()
     # 6) Adapt partial signature with the single (r_0, r_1)
     for node in nodes:
-        node.adapt(indexed_msg)
-
+        node.adapt()
     # 7) Choose a subset T of size t
     subset_T = sample(nodes, k=threshold)
-    
+    distribute_rand_partial_signatures(subset_T)
     # 8) Reconstruct final signature from subset T
-    signature = reconst_signature(subset_T, public_parameters, indexed_msg)
+    signature = reconst_signature(subset_T, public_parameters)
     if not signature:
         print("Signature reconstruction failed.")
         exit(1)
-
     # 9) Randomize the *global* VK => vk' = (g2^{x+r_0}, g2^{y+r_1})
     global_rand = get_global_randomizer(subset_T)
     vk_prime = rand_pk(global_vk, global_rand[0], global_rand[1], public_parameters)
+    
+    #3rd party verified can do the the verification.
+    id = 0
+    verifer_node = Node(id, public_parameters, threshold, message, index)
+    indexed_msg = verifer_node.indexed_message_encoding(public_parameters, message, index)
 
     # 10) Verify
     ok = verify_signature(public_parameters, vk_prime, indexed_msg, signature)
@@ -739,5 +725,4 @@ if __name__ == "__main__":
         print("✅  Signature verification PASSED.")
     else:
         print("❌  Signature verification FAILED.")
-
     print("Done.")
